@@ -1,0 +1,638 @@
+To modify the script to retrieve the username and password for the `hello.test.login` API from a UserForm instead of using `InputBox`, we’ll need to:
+
+1. Create a UserForm with fields for username and password.
+2. Update the script to call this UserForm and retrieve the values entered by the user.
+
+Here’s how we’ll do it:
+
+---
+
+### Step 1: Create the UserForm
+1. In the VBA Editor (Alt + F11), go to **Insert > UserForm**.
+2. Name the UserForm `LoginForm`.
+3. Add the following controls to the UserForm:
+   - **Label1**: Caption = "Username:"
+   - **TextBox1**: Name = `txtUsername`
+   - **Label2**: Caption = "Password:"
+   - **TextBox2**: Name = `txtPassword`, set `PasswordChar` to `*` (for masking input)
+   - **CommandButton1**: Name = `cmdOK`, Caption = "OK"
+   - **CommandButton2**: Name = `cmdCancel`, Caption = "Cancel"
+
+4. Add the following code to the UserForm module (double-click the UserForm in the Project Explorer to open its code window):
+
+```vba
+' UserForm code for LoginForm
+Private Sub cmdOK_Click()
+    ' Store values and close form
+    Me.Tag = "OK" ' Indicate OK was clicked
+    Me.Hide
+End Sub
+
+Private Sub cmdCancel_Click()
+    ' Indicate cancellation and close form
+    Me.Tag = "Cancel"
+    Me.Hide
+End Sub
+
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    ' If closed via X button, treat as Cancel
+    If CloseMode = vbFormControlMenu Then
+        Me.Tag = "Cancel"
+        Cancel = True
+        Me.Hide
+    End If
+End Sub
+```
+
+This code handles the OK and Cancel buttons and ensures closing the form via the X button is treated as a cancellation.
+
+---
+
+### Step 2: Update the Main Script
+Replace the `InputBox` calls with code to show the UserForm and retrieve the username and password. Here’s the updated script:
+
+```vba
+Sub GetAllTestCasesAndInteractWithAPI()
+    Dim tdc As Object
+    Dim testSetTreeMgr As Object
+    Dim rootFolder As Object
+    Dim subFolder As Object
+    Dim testSetList As Object
+    Dim testSet As Object
+    Dim testInstanceFactory As Object
+    Dim testInstanceList As Object
+    Dim testInstance As Object
+    Dim ws1 As Worksheet, ws2 As Worksheet, ws3 As Worksheet
+    Dim row As Long
+    Dim testData() As Variant
+    Dim i As Long, j As Long, k As Long
+    Dim temp As Variant
+    Dim xmlhttp As Object
+    Dim loginResponse As String, usecaseResponse As String, scompResponse As String
+    Dim username As String, password As String
+    Dim jsonBody As String
+    Dim jsonObj As Object, scompJsonObj As Object
+    Dim lastRow3 As Long, lastRow1 As Long, lastRow2 As Long
+    Dim uti As String, configId As String
+    Dim tcPos As Long, sukPos As Long
+    Dim foundMatch As Boolean
+    Dim testLabPath As String
+    Dim totalTests As Long
+    Dim subFolders As Object
+    
+    ' Define output starting row for ALMtestLab only
+    Const OUTPUT_START_ROW As Long = 2
+    
+    ' Validate ALMtestLab, CasperSummary, and CasperSimComp exist
+    On Error Resume Next
+    Set ws1 = ThisWorkbook.Sheets("ALMtestLab")
+    Set ws2 = ThisWorkbook.Sheets("CasperSummary")
+    Set ws3 = ThisWorkbook.Sheets("CasperSimComp")
+    If ws1 Is Nothing Then
+        MsgBox "Sheet 'ALMtestLab' not found in the workbook.", vbCritical, "ERROR"
+        Exit Sub
+    End If
+    If ws2 Is Nothing Then
+        MsgBox "Sheet 'CasperSummary' not found in the workbook.", vbCritical, "ERROR"
+        Exit Sub
+    End If
+    If ws3 Is Nothing Then
+        MsgBox "Sheet 'CasperSimComp' not found in the workbook.", vbCritical, "ERROR"
+        Exit Sub
+    End If
+    On Error GoTo 0
+    
+    ' Clear CasperSummary and CasperSimComp at the start of every run
+    ws2.Cells.Clear
+    ws3.Cells.Clear
+    
+    ' Get Test Lab path from Data B1
+    testLabPath = Trim(ThisWorkbook.Sheets("Data").Range("B1").Value)
+    If testLabPath = "" Then
+        MsgBox "Test Lab path not specified in Data B1", vbCritical, "ERROR"
+        Exit Sub
+    End If
+    
+    ' Ensure Test Lab path starts with "Root\" and ends with "\"
+    If Left(testLabPath, 5) <> "Root\" Then
+        testLabPath = "Root\" & testLabPath
+    End If
+    If Right(testLabPath, 1) <> "\" Then
+        testLabPath = testLabPath & "\"
+    End If
+    testLabPath = Replace(testLabPath, "/", "\") ' Replace forward slashes with backslashes
+    
+    ' Prepare ALMtestLab - Clear range
+    With ws1
+        .Range("A1:L" & .Rows.Count).Clear
+        ' Add headers
+        .Range("A1").Value = "Test Lab Folder"
+        .Range("B1").Value = "Test Set Name"
+        .Range("C1").Value = "Test Name"
+        .Range("D1").Value = "Configuration ID"
+        .Range("E1").Value = "Status"
+        .Range("F1").Value = "Subject"
+        .Range("G1").Value = "Test cases user name"
+        .Range("H1").Value = "User-Template-02"
+        .Range("I1").Value = "Completion of CSV"
+        .Range("J1").Value = "Completion of XML"
+        .Range("K1").Value = "req_id for CSV"
+        .Range("L1").Value = "req_id for XML"
+    End With
+    
+    ' Connect to ALM
+    Set tdc = CreateObject("TDApiOle80.TDConnection")
+    On Error Resume Next
+    tdc.InitConnectionWithApiKey "https://alm.ccc.com/qcbin", "apikey-c", "ch"
+    If Err.Number <> 0 Or Not tdc.LoggedIn Then
+        MsgBox "HP ALM User Authentication Failed. Error: " & Err.Description, vbCritical, "ERROR"
+        Err.Clear
+        GoTo LastLine
+    End If
+    On Error GoTo 0
+    
+    tdc.Connect "KIT", "RTR"
+    If tdc.AuthenticationToken = "" Then
+        MsgBox "Access Denied for your ALM project", vbCritical, "ERROR"
+        GoTo LastLine
+    End If
+    
+    Application.ScreenUpdating = False
+    Application.StatusBar = "Connected to ALM"
+    
+    ' Get TestSet Tree Manager and navigate to the root folder
+    Set testSetTreeMgr = tdc.TestSetTreeManager
+    On Error Resume Next
+    Set rootFolder = testSetTreeMgr.NodeByPath(testLabPath)
+    If rootFolder Is Nothing Then
+        MsgBox "Test Lab root path not found: " & testLabPath & vbCrLf & "Error: " & Err.Description, vbCritical, "ERROR"
+        Err.Clear
+        GoTo LastLine
+    End If
+    On Error GoTo 0
+    
+    ' Count total test instances across all subfolders (or root if no subfolders)
+    totalTests = 0
+    Set subFolders = rootFolder.SubNodes
+    
+    If subFolders.Count > 0 Then
+        ' Case 1: Root folder has subfolders
+        For Each subFolder In subFolders
+            Set testSetList = subFolder.FindTestSets("")
+            If Not testSetList Is Nothing Then
+                For Each testSet In testSetList
+                    Set testInstanceFactory = testSet.TSTestFactory
+                    Set testInstanceList = testInstanceFactory.NewList("")
+                    totalTests = totalTests + testInstanceList.Count
+                Next
+            End If
+        Next
+    Else
+        ' Case 2: No subfolders, get test sets directly from root
+        Set testSetList = rootFolder.FindTestSets("")
+        If Not testSetList Is Nothing Then
+            For Each testSet In testSetList
+                Set testInstanceFactory = testSet.TSTestFactory
+                Set testInstanceList = testInstanceFactory.NewList("")
+                totalTests = totalTests + testInstanceList.Count
+            Next
+        End If
+    End If
+    
+    If totalTests = 0 Then
+        MsgBox "No test instances found in the Test Lab path: " & testLabPath, vbInformation, "No Data"
+        GoTo LastLine
+    End If
+    
+    ' Redimension array to store test data (8 columns)
+    ReDim testData(1 To totalTests, 1 To 8)
+    
+    ' Populate the array with test data (Test Lab Folder in first column)
+    i = 1
+    If subFolders.Count > 0 Then
+        ' Case 1: Process subfolders
+        For Each subFolder In subFolders
+            Set testSetList = subFolder.FindTestSets("")
+            If Not testSetList Is Nothing Then
+                For Each testSet In testSetList
+                    Set testInstanceFactory = testSet.TSTestFactory
+                    Set testInstanceList = testInstanceFactory.NewList("")
+                    For Each testInstance In testInstanceList
+                        testData(i, 1) = subFolder.Name ' Test Lab Folder
+                        testData(i, 2) = testSet.Name
+                        testData(i, 3) = testInstance.TestName
+                        testData(i, 4) = testInstance.ID
+                        testData(i, 5) = testInstance.Status
+                        testData(i, 6) = testInstance.Test.Field("TS_SUBJECT")
+                        testData(i, 7) = testInstance.Test.Field("TS_USER_11")
+                        testData(i, 8) = testInstance.Test.Field("TS_USER_02")
+                        i = i + 1
+                        Application.StatusBar = "Collecting test " & i - 1
+                    Next
+                Next
+            End If
+        Next
+    Else
+        ' Case 2: No subfolders, use root folder
+        Set testSetList = rootFolder.FindTestSets("")
+        If Not testSetList Is Nothing Then
+            For Each testSet In testSetList
+                Set testInstanceFactory = testSet.TSTestFactory
+                Set testInstanceList = testInstanceFactory.NewList("")
+                For Each testInstance In testInstanceList
+                    testData(i, 1) = Split(testLabPath, "\")(UBound(Split(testLabPath, "\")) - 1) ' Root folder name
+                    testData(i, 2) = testSet.Name
+                    testData(i, 3) = testInstance.TestName
+                    testData(i, 4) = testInstance.ID
+                    testData(i, 5) = testInstance.Status
+                    testData(i, 6) = testInstance.Test.Field("TS_SUBJECT")
+                    testData(i, 7) = testInstance.Test.Field("TS_USER_11")
+                    testData(i, 8) = testInstance.Test.Field("TS_USER_02")
+                    i = i + 1
+                    Application.StatusBar = "Collecting test " & i - 1
+                Next
+            Next
+        End If
+    End If
+    
+    ' Sort the array by Test Lab Folder (Column A)
+    For i = LBound(testData, 1) To UBound(testData, 1) - 1
+        For j = i + 1 To UBound(testData, 1)
+            If testData(i, 1) > testData(j, 1) Then
+                For k = 1 To 8
+                    temp = testData(i, k)
+                    testData(i, k) = testData(j, k)
+                    testData(j, k) = temp
+                Next k
+            End If
+        Next j
+    Next i
+    
+    ' Write sorted data to ALMtestLab starting at OUTPUT_START_ROW
+    row = OUTPUT_START_ROW
+    For i = 1 To totalTests
+        If row > 1048576 Then
+            ws1.Range("A" & row).Value = "Row limit reached. Some test cases may not be displayed."
+            Exit For
+        End If
+        With ws1
+            .Range("A" & row).Value = testData(i, 1) ' Test Lab Folder
+            .Range("B" & row).Value = testData(i, 2)
+            .Range("C" & row).Value = testData(i, 3)
+            .Range("D" & row).Value = testData(i, 4)
+            .Range("E" & row).Value = testData(i, 5)
+            .Range("F" & row).Value = testData(i, 6)
+            .Range("G" & row).Value = testData(i, 7)
+            .Range("H" & row).Value = testData(i, 8)
+        End With
+        row = row + 1
+        Application.StatusBar = "Writing test " & (row - OUTPUT_START_ROW)
+    Next i
+    
+    ' --- API Interaction ---
+    Set xmlhttp = CreateObject("MSXML2.XMLHTTP")
+    
+    ' Show UserForm to get login credentials
+    With LoginForm
+        .Show vbModal ' Show as modal to wait for user input
+        If .Tag = "Cancel" Then
+            MsgBox "Login cancelled by user.", vbExclamation, "Cancelled"
+            Unload LoginForm
+            GoTo LastLine
+        End If
+        username = .txtUsername.Text
+        password = .txtPassword.Text
+        Unload LoginForm ' Clean up after retrieving values
+    End With
+    
+    If username = "" Or password = "" Then
+        MsgBox "Username and password are required.", vbExclamation, "ERROR"
+        GoTo LastLine
+    End If
+    
+    ' Call hello.test.login API with UserForm credentials
+    With xmlhttp
+        .Open "POST", "https://hello.test.login", False
+        .setRequestHeader "Content-Type", "application/json"
+        .send "{""username"": """ & username & """, ""password"": """ & password & """}"
+        loginResponse = .responseText
+    End With
+    
+    MsgBox "Login API Response (Status " & xmlhttp.Status & "): " & vbCrLf & _
+           "Username: " & username & vbCrLf & "Password: ***" & vbCrLf & loginResponse, vbInformation, "Login Result"
+    
+    ' Get JSON body from ALMtestLab M1 for hellos.test.usecase
+    jsonBody = ws1.Range("M1").Value
+    If jsonBody = "" Then
+        MsgBox "No JSON body found in ALMtestLab M1.", vbExclamation, "ERROR"
+        GoTo LastLine
+    End If
+    
+    ' Call hellos.test.usecase API
+    With xmlhttp
+        .Open "POST", "https://hellos.test.usecase", False
+        .setRequestHeader "Content-Type", "application/json"
+        .send jsonBody
+        usecaseResponse = .responseText
+    End With
+    
+    If xmlhttp.Status <> 200 Then
+        MsgBox "Usecase API failed (Status " & xmlhttp.Status & "): " & usecaseResponse, vbCritical, "ERROR"
+        GoTo LastLine
+    End If
+    
+    ' Process hellos.test.usecase response
+    Set jsonObj = ParseJsonCustom(usecaseResponse)
+    If Not jsonObj Is Nothing Then
+        Call WriteJsonToSheet2(jsonObj, ws2)
+        If MsgBox("Usecase API Response (Status " & xmlhttp.Status & "): " & vbCrLf & usecaseResponse & vbCrLf & vbCrLf & _
+                  "Response written to CasperSummary. Click OK to proceed with usecase.scomp API.", vbOKCancel + vbInformation, "Usecase Result") = vbOK Then
+            
+            ws3.Range("A1").Value = "UTI"
+            ws3.Range("B1").Value = "Action Type"
+            ws3.Range("C1").Value = "CSV-Code"
+            ws3.Range("D1").Value = "JSON-Code"
+            ws3.Range("E1").Value = "CSV-Description"
+            ws3.Range("F1").Value = "JSON-Description"
+            ws3.Range("G1").Value = "Test-Result"
+            ws3.Range("H1").Value = "req_id"
+            ws3.Range("I1").Value = "format"
+            row = 1
+            i = 2
+            Do While ws2.Cells(i, 1).Value <> ""
+                jsonBody = "{""req_id"": """ & ws2.Cells(i, 1).Value & """, ""flag"": ""comp""}"
+                Debug.Print "Sending usecase.scomp API Request for CasperSummary A" & i & ": " & jsonBody
+                
+                With xmlhttp
+                    .Open "POST", "https://usecase.scomp", False
+                    .setRequestHeader "Content-Type", "application/json"
+                    .send jsonBody
+                    scompResponse = .responseText
+                End With
+                
+                Debug.Print "Scomp Response for CasperSummary A" & i & ": " & scompResponse
+                
+                If xmlhttp.Status = 200 Then
+                    Set scompJsonObj = ParseJsonCustom(scompResponse)
+                    If Not scompJsonObj Is Nothing Then
+                        Call WriteScompToSheet3(scompJsonObj, ws3, row, ws2.Cells(i, 1).Value)
+                        row = row + 1
+                    Else
+                        ws3.Cells(row + 1, 1).Value = "Failed to parse scomp response: " & scompResponse
+                        row = row + 1
+                    End If
+                Else
+                    ws3.Cells(row + 1, 1).Value = "Scomp API failed (Status " & xmlhttp.Status & "): " & scompResponse
+                    row = row + 1
+                End If
+                i = i + 1
+            Loop
+            
+            If row > 1 Then
+                ' Add format from CasperSummary based on req_id
+                lastRow2 = ws2.Cells(ws2.Rows.Count, "A").End(xlUp).row
+                lastRow3 = ws3.Cells(ws3.Rows.Count, "A").End(xlUp).row
+                For i = 2 To lastRow3
+                    Dim reqId As String
+                    reqId = ws3.Cells(i, 8).Value
+                    For j = 2 To lastRow2
+                        If ws2.Cells(j, 1).Value = reqId Then
+                            ws3.Cells(i, 9).Value = ws2.Cells(j, 11).Value ' Column K (format)
+                            Exit For
+                        End If
+                    Next j
+                    If ws3.Cells(i, 9).Value = "" Then
+                        ws3.Cells(i, 9).Value = "N/A"
+                    End If
+                Next i
+                MsgBox "Scomp responses written to CasperSimComp with format from CasperSummary.", vbInformation, "Success"
+            Else
+                MsgBox "No valid data found in CasperSummary Column A for usecase.scomp API.", vbExclamation, "Warning"
+            End If
+            
+            ' --- Update Test Case Status and Copy req_id ---
+            lastRow3 = ws3.Cells(ws3.Rows.Count, "A").End(xlUp).row
+            lastRow1 = ws1.Cells(ws1.Rows.Count, "A").End(xlUp).row
+            
+            If lastRow3 > 1 Then
+                For i = 2 To lastRow3
+                    uti = Trim(ws3.Cells(i, 1).Value)
+                    If uti <> "" Then
+                        tcPos = InStr(1, uti, "TC", vbTextCompare)
+                        sukPos = InStr(1, uti, "SUK", vbTextCompare)
+                        If tcPos > 0 And sukPos > tcPos Then
+                            configId = Mid(uti, tcPos + 2, sukPos - tcPos - 2)
+                        Else
+                            configId = uti
+                        End If
+                        
+                        foundMatch = False
+                        For j = OUTPUT_START_ROW To lastRow1
+                            If Trim(ws1.Cells(j, 4).Value) = configId Then ' Configuration ID in D
+                                ' Update based on format from CasperSimComp
+                                If UCase(ws3.Cells(i, 9).Value) = "CSV" Then
+                                    ws1.Cells(j, 9).Value = "Done"          ' Completion of CSV (I)
+                                    ws1.Cells(j, 11).Value = ws3.Cells(i, 8).Value ' req_id for CSV (K)
+                                ElseIf UCase(ws3.Cells(i, 9).Value) = "XML" Then
+                                    ws1.Cells(j, 10).Value = "Done"         ' Completion of XML (J)
+                                    ws1.Cells(j, 12).Value = ws3.Cells(i, 8).Value ' req_id for XML (L)
+                                End If
+                                foundMatch = True
+                                Exit For
+                            End If
+                        Next j
+                        
+                        ' If no match found, mark unmatched rows as Not_Done
+                        If Not foundMatch Then
+                            For j = OUTPUT_START_ROW To lastRow1
+                                If ws1.Cells(j, 9).Value = "" Then
+                                    ws1.Cells(j, 9).Value = "Not_Done" ' Completion of CSV
+                                End If
+                                If ws1.Cells(j, 10).Value = "" Then
+                                    ws1.Cells(j, 10).Value = "Not_Done" ' Completion of XML
+                                End If
+                            Next j
+                        End If
+                    End If
+                Next i
+                MsgBox "Test case status and req_id updated in ALMtestLab Columns I-L based on Configuration ID and format.", vbInformation, "Success"
+            Else
+                MsgBox "No data found in CasperSimComp Column A for status update.", vbExclamation, "Warning"
+            End If
+        End If
+    Else
+        ws2.Range("A1").Value = "Failed to parse JSON: " & usecaseResponse
+        MsgBox "Failed to parse usecase response JSON. Raw response written to CasperSummary A1.", vbExclamation, "Warning"
+    End If
+    
+LastLine:
+    ' Cleanup
+    If Not tdc Is Nothing Then
+        tdc.Disconnect
+        Set tdc = Nothing
+    End If
+    Set xmlhttp = Nothing
+    Application.ScreenUpdating = True
+    With ws1
+        lastRow1 = .Cells(.Rows.Count, "A").End(xlUp).row
+        If lastRow1 >= OUTPUT_START_ROW Then
+            Application.StatusBar = "DONE - " & (lastRow1 - OUTPUT_START_ROW + 1) & " test cases retrieved"
+            MsgBox "Process completed. Number of test cases: " & (lastRow1 - OUTPUT_START_ROW + 1), vbInformation, "DONE"
+        Else
+            Application.StatusBar = "DONE - No test cases found"
+            MsgBox "No test cases found in the project", vbInformation, "DONE"
+        End If
+    End With
+End Sub
+
+' Helper function to parse JSON
+Private Function ParseJsonCustom(jsonString As String) As Object
+    On Error Resume Next
+    Set ParseJsonCustom = JsonConverter.ParseJson(jsonString)
+    If Err.Number <> 0 Then
+        MsgBox "JSON parsing failed: " & jsonString & vbCrLf & "Error: " & Err.Description, vbCritical, "ERROR"
+        Set ParseJsonCustom = Nothing
+    End If
+    On Error GoTo 0
+End Function
+
+' Helper function to write hellos.test.usecase response to CasperSummary
+Private Sub WriteJsonToSheet2(jsonObj As Object, ws As Worksheet)
+    Dim row As Long, col As Long
+    Dim key As Variant
+    Dim item As Variant
+    
+    row = 1
+    If Not jsonObj Is Nothing Then
+        If TypeName(jsonObj) = "Collection" Then
+            If jsonObj.Count > 0 Then
+                Set item = jsonObj(1)
+                col = 1
+                For Each key In item.Keys
+                    ws.Cells(row, col).Value = key
+                    col = col + 1
+                Next key
+                row = row + 1
+                
+                For Each item In jsonObj
+                    col = 1
+                    For Each key In item.Keys
+                        ws.Cells(row, col).Value = item(key)
+                        col = col + 1
+                    Next key
+                    row = row + 1
+                Next item
+            Else
+                ws.Range("A1").Value = "Empty JSON array"
+            End If
+        Else
+            ws.Range("A1").Value = "Expected an array of objects, got: " & TypeName(jsonObj)
+        End If
+    Else
+        ws.Range("A1").Value = "No valid JSON object to write"
+    End If
+End Sub
+
+' Helper function to write usecase.scomp Response-Validate to CasperSimComp
+Private Sub WriteScompToSheet3(jsonObj As Object, ws As Worksheet, ByRef startRow As Long, reqId As String)
+    Dim col As Long
+    Dim key As Variant
+    Dim responseValidateItem As Object
+    Dim responseValidateCollection As Object
+    Dim dataObj As Object
+    
+    If Not jsonObj Is Nothing Then
+        If jsonObj.Exists("data") Then
+            Set dataObj = jsonObj("data")
+            If TypeName(dataObj) = "Dictionary" And dataObj.Exists("Response-Validate") Then
+                Set responseValidateCollection = dataObj("Response-Validate")
+                If TypeName(responseValidateCollection) = "Collection" Then
+                    If responseValidateCollection.Count > 0 Then
+                        For Each responseValidateItem In responseValidateCollection
+                            col = 1
+                            For Each key In responseValidateItem.Keys
+                                ws.Cells(startRow + 1, col).Value = responseValidateItem(key)
+                                col = col + 1
+                            Next key
+                            ws.Cells(startRow + 1, 8).Value = reqId ' Column H for req_id
+                            startRow = startRow + 1
+                        Next responseValidateItem
+                    Else
+                        ws.Cells(startRow + 1, 1).Value = "Response-Validate array is empty"
+                        startRow = startRow + 1
+                    End If
+                Else
+                    ws.Cells(startRow + 1, 1).Value = "Response-Validate is not a collection: " & TypeName(responseValidateCollection)
+                    startRow = startRow + 1
+                End If
+            Else
+                ws.Cells(startRow + 1, 1).Value = "No 'Response-Validate' key in 'data' or 'data' is not a Dictionary: " & TypeName(dataObj)
+                startRow = startRow + 1
+            End If
+        Else
+            ws.Cells(startRow + 1, 8).Value = reqId ' Column H for req_id
+            startRow = startRow + 1
+        End If
+    Else
+        ws.Cells(startRow + 1, 1).Value = "No valid scomp JSON object to write"
+        startRow = startRow + 1
+    End If
+End Sub
+```
+
+---
+
+### Key Changes
+1. **Replaced InputBox with UserForm**:
+   - Removed `username = InputBox(...)` and `password = InputBox(...)`.
+   - Added code to show `LoginForm`, retrieve `txtUsername.Text` and `txtPassword.Text`, and handle cancellation:
+     ```vba
+     With LoginForm
+         .Show vbModal
+         If .Tag = "Cancel" Then
+             MsgBox "Login cancelled by user.", vbExclamation, "Cancelled"
+             Unload LoginForm
+             GoTo LastLine
+         End If
+         username = .txtUsername.Text
+         password = .txtPassword.Text
+         Unload LoginForm
+     End With
+     ```
+
+2. **UserForm Behavior**:
+   - The form appears modally (pauses script execution until closed).
+   - If the user clicks "Cancel" or closes the form via the X button, the script exits with a cancellation message.
+   - If "OK" is clicked, the script retrieves the entered username and password and proceeds.
+
+---
+
+### How to Use
+1. **Add the UserForm**:
+   - Follow the instructions in Step 1 to create `LoginForm` with the specified controls and code.
+
+2. **Run the Script**:
+   - When the script reaches the API login section, `LoginForm` will pop up.
+   - Enter the username and password, then click "OK" to proceed or "Cancel" to abort.
+   - The script will use these credentials for the `hello.test.login` API call.
+
+3. **Error Handling**:
+   - If either field is left blank and "OK" is clicked, the script will display "Username and password are required" and exit.
+
+---
+
+### Example UserForm Layout
+```
+-------------------------
+| Login                 |
+-------------------------
+| Username: [txtUsername] |
+| Password: [txtPassword] |
+| [OK]      [Cancel]     |
+-------------------------
+```
+
+- `txtPassword` will show asterisks (`*`) as you type for security.
+- Clicking "OK" submits the credentials; "Cancel" or closing the form aborts the process.
+
+This modification replaces the `InputBox` prompts with a more user-friendly UserForm interface. Let me know if you need help setting up the UserForm or further adjustments!
